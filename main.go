@@ -5,11 +5,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	logger "github.com/paaavkata/go-logger"
-	"github.com/twmb/franz-go/pkg/kgo"
+	gonats "github.com/paaavkata/go-nats"
 )
 
 func main() {
@@ -26,11 +29,11 @@ func main() {
 		nil)
 
 	if len(os.Args) != 4 {
-		fmt.Println("Usage: kafka-producer <broker> <topic> <payload>")
+		fmt.Println("Usage: kafka-producer <nats-url> <topic> <payload>")
 		os.Exit(1)
 	}
 
-	broker := os.Args[1]
+	url := os.Args[1]
 	topic := os.Args[2]
 	payloadBase64 := os.Args[3]
 
@@ -39,20 +42,27 @@ func main() {
 		os.Exit(1)
 	}
 
-	if broker == "" || topic == "" || payloadBase64 == "" {
-		broker = os.Getenv("KAFKA_BROKER")   // e.g., "kafka-broker:9092"
-		topic = os.Getenv("KAFKA_TOPIC")     // e.g., "job-status"
-		payloadBase64 = os.Getenv("PAYLOAD") // Base64-encoded JSON payload
-
-		if payloadBase64 == "" {
-			fmt.Println("Error: PAYLOAD environment variable is required.")
-			os.Exit(1)
-		}
-	}
-
-	logger.Debugf("broker: %s", broker)
+	logger.Debugf("url: %s", url)
 	logger.Debugf("topic: %s", topic)
 	logger.Debugf("payload: %s", string(payloadBase64))
+	logger.Infof("Starting producer with url=%s topic=%s payload_b64_len=%d", url, topic, len(payloadBase64))
+
+	// Optional timeout (seconds) for the produce request.
+	// Defaults to 20s to avoid hanging init containers indefinitely.
+	// NATS_PRODUCE_TIMEOUT_SEC preferred; KAFKA_PRODUCE_TIMEOUT_SEC accepted
+	// for backward compatibility with existing pod templates.
+	produceTimeoutSec := 20
+	timeoutEnv := os.Getenv("NATS_PRODUCE_TIMEOUT_SEC")
+	if timeoutEnv == "" {
+		timeoutEnv = os.Getenv("KAFKA_PRODUCE_TIMEOUT_SEC")
+	}
+	if timeoutEnv != "" {
+		if parsed, err := strconv.Atoi(timeoutEnv); err == nil && parsed > 0 {
+			produceTimeoutSec = parsed
+		} else {
+			logger.Errorf("Invalid produce timeout %q, using default=%ds", timeoutEnv, produceTimeoutSec)
+		}
+	}
 
 	// Decode base64 payload
 	payloadBytes, err := base64.StdEncoding.DecodeString(payloadBase64)
@@ -67,40 +77,58 @@ func main() {
 		fmt.Println("Error parsing JSON payload:", err)
 		os.Exit(1)
 	}
+	logger.Infof("Payload decoded and validated as JSON")
+
+	// Best-effort network diagnostics to quickly identify DNS/connectivity issues
+	hostPort := strings.TrimPrefix(strings.TrimPrefix(url, "nats://"), "tls://")
+	host, port, splitErr := net.SplitHostPort(hostPort)
+	if splitErr == nil {
+		ips, err := net.LookupHost(host)
+		if err != nil {
+			logger.Errorf("DNS lookup failed for host=%s: %v", host, err)
+		} else {
+			logger.Infof("DNS lookup for host=%s resolved to: %v", host, ips)
+		}
+
+		dialTimeout := 3 * time.Second
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), dialTimeout)
+		if err != nil {
+			logger.Errorf("TCP dial check failed to %s:%s (timeout=%s): %v", host, port, dialTimeout, err)
+		} else {
+			logger.Infof("TCP dial check succeeded to %s:%s", host, port)
+			_ = conn.Close()
+		}
+	} else {
+		logger.Errorf("Could not parse host:port from %q: %v", hostPort, splitErr)
+	}
 
 	// Add timestamp to payload
 	jsonPayload["timestamp"] = time.Now().Unix()
 
-	// Re-encode JSON payload
-	payloadBytes, err = json.Marshal(jsonPayload)
+	producer, err := gonats.NewProducer(&gonats.ProducerConfig{
+		URLs:     []string{url},
+		ClientID: "kafka-producer",
+		Topic:    topic,
+		Timeout:  time.Duration(produceTimeoutSec) * time.Second,
+	})
 	if err != nil {
-		fmt.Println("Error encoding JSON payload:", err)
+		fmt.Println("Failed to create NATS producer:", err)
 		os.Exit(1)
 	}
+	logger.Infof("NATS producer created successfully")
 
-	// Create Kafka producer
-	client, err := kgo.NewClient(
-		kgo.SeedBrokers(broker),
-	)
-	if err != nil {
-		fmt.Println("Failed to create Kafka client:", err)
-		os.Exit(1)
-	}
-
-	// Produce message
-	record := &kgo.Record{
-		Topic: topic,
-		Value: payloadBytes,
-	}
-	ctx := context.Background()
-	err = client.ProduceSync(ctx, record).FirstErr()
-	if err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(produceTimeoutSec)*time.Second)
+	defer cancel()
+	logger.Infof("Producing message with timeout=%ds", produceTimeoutSec)
+	if err := producer.SendMessageWithContext(ctx, "", jsonPayload); err != nil {
 		fmt.Println("Failed to send message:", err)
 		os.Exit(1)
 	}
+	logger.Infof("Message produced successfully")
 
 	// Ensure the producer exits after the first successful send.
-	client.Close()
+	producer.Close()
+	payloadBytes, _ = json.Marshal(jsonPayload)
 	fmt.Println("Message sent successfully:", string(payloadBytes))
 	os.Exit(0)
 }
