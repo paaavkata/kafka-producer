@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/paaavkata/go-logger v0.1.1
-	github.com/paaavkata/go-nats v0.1.0
+	github.com/paaavkata/go-nats v0.3.1
 )
 
 replace github.com/paaavkata/go-logger => ../shared-libs/go-logger
